@@ -118,7 +118,7 @@ app.post("/api/suggest-replies", async (req, res) => {
 });
 
 // ============================================
-// ENDPOINT ADMIN: generate embedding LOKAL untuk data KB yang belum punya
+// ENDPOINT ADMIN: generate embedding LOKAL untuk pertanyaan yang belum punya
 // Cara pakai: buka di browser
 //   https://server-kamu.onrender.com/admin/generate-embeddings?secret=ISI_SECRET_KAMU
 // ============================================
@@ -130,24 +130,25 @@ app.get("/admin/generate-embeddings", async (req, res) => {
 
   try {
     const { data: rows, error } = await supabase
-      .from("knowledge_base")
-      .select("id, question, answer")
+      .from("faq_questions")
+      .select("id, question, faq_answers(answer)")
       .is("embedding", null);
 
     if (error) throw error;
 
     if (!rows || rows.length === 0) {
-      return res.json({ message: "Tidak ada data yang perlu di-generate embedding-nya.", processed: 0 });
+      return res.json({ message: "Tidak ada pertanyaan yang perlu di-generate embedding-nya.", processed: 0 });
     }
 
     const results = [];
     for (const row of rows) {
-      const combinedText = `${row.question}\n${row.answer}`;
+      const answerText = row.faq_answers ? row.faq_answers.answer : "";
+      const combinedText = `${row.question}\n${answerText}`;
       try {
         const embedding = await getEmbeddingLocal(combinedText);
         const { error: updateError } = await supabase
-          .from("knowledge_base")
-          .update({ embedding, updated_at: new Date().toISOString() })
+          .from("faq_questions")
+          .update({ embedding })
           .eq("id", row.id);
 
         if (updateError) throw updateError;
@@ -162,6 +163,147 @@ app.get("/admin/generate-embeddings", async (req, res) => {
     console.error(err);
     res.status(500).json({ error: "Gagal menjalankan proses generate embedding" });
   }
+});
+
+// ============================================
+// ENDPOINT ADMIN: bulk-insert FAQ (1 jawaban + banyak variasi pertanyaan)
+// Insert ke 2 tabel: faq_answers (sekali) lalu faq_questions (banyak baris)
+// Dipanggil dari halaman form /admin/bulk-insert (lihat di bawah)
+// ============================================
+app.post("/admin/bulk-insert-faq", async (req, res) => {
+  const { secret, groups } = req.body;
+  if (!process.env.ADMIN_SECRET || secret !== process.env.ADMIN_SECRET) {
+    return res.status(403).json({ error: "Secret salah atau belum di-set" });
+  }
+  if (!Array.isArray(groups) || groups.length === 0) {
+    return res.status(400).json({ error: "Format 'groups' tidak valid atau kosong" });
+  }
+
+  const results = [];
+
+  for (const group of groups) {
+    const { answer, kategori, question_variations } = group;
+    if (!answer || !Array.isArray(question_variations) || question_variations.length === 0) {
+      results.push({ status: "dilewati", reason: "answer atau question_variations kosong", group });
+      continue;
+    }
+
+    // 1. Insert jawabannya SEKALI ke faq_answers
+    const { data: answerRow, error: answerError } = await supabase
+      .from("faq_answers")
+      .insert({ answer, kategori: kategori || null })
+      .select("id")
+      .single();
+
+    if (answerError) {
+      results.push({ status: "gagal", reason: "gagal insert jawaban: " + answerError.message, group });
+      continue;
+    }
+
+    // 2. Insert tiap variasi pertanyaan ke faq_questions, link ke jawaban di atas
+    for (const question of question_variations) {
+      try {
+        const embedding = await getEmbeddingLocal(`${question}\n${answer}`);
+        const { error } = await supabase
+          .from("faq_questions")
+          .insert({ faq_answer_id: answerRow.id, question, embedding });
+
+        if (error) throw error;
+        results.push({ status: "ok", question });
+      } catch (err) {
+        results.push({ status: "gagal", question, error: err.message });
+      }
+    }
+  }
+
+  const okCount = results.filter((r) => r.status === "ok").length;
+  res.json({ message: `Selesai. ${okCount} baris pertanyaan berhasil ditambahkan.`, results });
+});
+
+// ============================================
+// HALAMAN FORM ADMIN: input FAQ langsung dari browser, tanpa perlu coding
+// Buka: https://server-kamu.onrender.com/admin/bulk-insert
+// ============================================
+app.get("/admin/bulk-insert", (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bulk Insert FAQ</title>
+<style>
+  body { font-family: sans-serif; max-width: 700px; margin: 20px auto; padding: 0 16px; background: #111; color: #eee; }
+  h1 { font-size: 18px; }
+  label { display: block; margin-top: 14px; margin-bottom: 4px; font-size: 13px; color: #aaa; }
+  input, textarea { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 6px; border: 1px solid #444; background: #1c1c1c; color: #eee; font-family: monospace; font-size: 13px; }
+  textarea { min-height: 260px; }
+  button { margin-top: 16px; padding: 12px 20px; background: #1a73e8; color: white; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; }
+  button:disabled { background: #555; }
+  #result { margin-top: 16px; padding: 12px; background: #1c1c1c; border-radius: 6px; white-space: pre-wrap; font-size: 12px; max-height: 300px; overflow-y: auto; }
+  .hint { font-size: 12px; color: #888; margin-top: 4px; }
+</style>
+</head>
+<body>
+  <h1>📥 Bulk Insert FAQ ke Knowledge Base</h1>
+
+  <label>Admin Secret</label>
+  <input type="password" id="secret" placeholder="Isi ADMIN_SECRET kamu">
+
+  <label>Data FAQ (format JSON)</label>
+  <div class="hint">Boleh isi lebih dari 1 grup. Tiap grup = 1 jawaban + banyak variasi pertanyaan.</div>
+  <textarea id="groups">[
+  {
+    "answer": "Refund bisa diajukan maksimal 7 hari setelah pembelian melalui menu Akun > Riwayat Pesanan.",
+    "kategori": "kebijakan",
+    "question_variations": [
+      "Bagaimana cara refund?",
+      "Gimana cara ngembaliin barang?",
+      "Mau refund gimana caranya kak?",
+      "Barang mau dikembalikan, prosesnya gimana?"
+    ]
+  }
+]</textarea>
+
+  <button id="submitBtn" onclick="submitData()">Simpan ke Knowledge Base</button>
+
+  <div id="result"></div>
+
+<script>
+async function submitData() {
+  const btn = document.getElementById('submitBtn');
+  const resultEl = document.getElementById('result');
+  const secret = document.getElementById('secret').value;
+  let groups;
+
+  try {
+    groups = JSON.parse(document.getElementById('groups').value);
+  } catch (e) {
+    resultEl.textContent = 'JSON tidak valid: ' + e.message;
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = 'Memproses... (mungkin beberapa detik)';
+  resultEl.textContent = '';
+
+  try {
+    const res = await fetch('/admin/bulk-insert-faq', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ secret, groups })
+    });
+    const data = await res.json();
+    resultEl.textContent = JSON.stringify(data, null, 2);
+  } catch (e) {
+    resultEl.textContent = 'Gagal: ' + e.message;
+  }
+
+  btn.disabled = false;
+  btn.textContent = 'Simpan ke Knowledge Base';
+}
+</script>
+</body>
+</html>`);
 });
 
 // ============================================
