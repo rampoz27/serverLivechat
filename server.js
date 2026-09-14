@@ -49,6 +49,79 @@ async function generateReply(systemPrompt, userMessage) {
 }
 
 // ============================================
+// STOPWORDS — kata umum bahasa Indonesia yang diabaikan saat cari keyword
+// ============================================
+const STOPWORDS = new Set([
+  "yang", "dan", "di", "ke", "dari", "ini", "itu", "saya", "kak", "kakak",
+  "gimana", "bagaimana", "cara", "apa", "apakah", "untuk", "dengan", "ada",
+  "bisa", "mau", "nya", "ya", "min", "kok", "gak", "ga", "tidak", "sih",
+  "aja", "juga", "atau", "kalau", "kalo", "saja", "pada", "adalah", "akan"
+]);
+
+function extractKeywords(text) {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter((w) => w.length > 2 && !STOPWORDS.has(w));
+}
+
+// ============================================
+// FALLBACK: cari lewat KATA KUNCI (kolom question + kategori)
+// Dipakai kalau embedding gagal, atau similarity semantik tidak ketemu apa-apa
+// ============================================
+async function keywordFallbackSearch(customerMessage, limit = 4) {
+  const words = extractKeywords(customerMessage);
+  if (words.length === 0) return [];
+
+  try {
+    // 1. Cari lewat kategori/isi jawaban yang match salah satu kata kunci
+    const answerFilter = words
+      .flatMap((w) => [`kategori.ilike.%${w}%`, `answer.ilike.%${w}%`])
+      .join(",");
+    const { data: answerMatches } = await supabase
+      .from("faq_answers")
+      .select("id, answer, kategori")
+      .or(answerFilter)
+      .limit(limit * 2);
+
+    // 2. Cari lewat isi pertanyaan (question) yang match salah satu kata kunci
+    const questionFilter = words.map((w) => `question.ilike.%${w}%`).join(",");
+    const { data: questionMatches } = await supabase
+      .from("faq_questions")
+      .select("faq_answer_id, question")
+      .or(questionFilter)
+      .limit(limit * 2);
+
+    let extraAnswers = [];
+    const answerIdsFromQuestions = [...new Set((questionMatches || []).map((q) => q.faq_answer_id))];
+    if (answerIdsFromQuestions.length > 0) {
+      const { data } = await supabase
+        .from("faq_answers")
+        .select("id, answer, kategori")
+        .in("id", answerIdsFromQuestions);
+      extraAnswers = data || [];
+    }
+
+    // Gabung & hilangkan duplikat berdasarkan id jawaban
+    const combinedMap = new Map();
+    [...(answerMatches || []), ...extraAnswers].forEach((a) => combinedMap.set(a.id, a));
+
+    return Array.from(combinedMap.values())
+      .slice(0, limit)
+      .map((a) => ({
+        answer: a.answer,
+        source: "keyword_fallback",
+        kategori: a.kategori,
+      }));
+  } catch (err) {
+    console.error("Keyword fallback gagal:", err);
+    return [];
+  }
+}
+
+// ============================================
 // ENDPOINT UTAMA: terima VEKTOR (dihitung di HP) + teks asli untuk konteks rewrite
 // ============================================
 app.post("/api/suggest-replies", async (req, res) => {
@@ -76,6 +149,11 @@ app.post("/api/suggest-replies", async (req, res) => {
     const relevant = (matches || []).filter((m) => m.similarity > 0.6);
 
     if (relevant.length === 0) {
+      // Semantik tidak nemu apa-apa — coba fallback kata kunci sebelum nyerah total
+      const keywordResults = await keywordFallbackSearch(customerMessage);
+      if (keywordResults.length > 0) {
+        return res.json({ suggestions: keywordResults });
+      }
       return res.json({
         suggestions: [
           {
@@ -112,8 +190,88 @@ app.post("/api/suggest-replies", async (req, res) => {
     const suggestions = rewritten ? [rewritten, ...directSuggestions] : directSuggestions;
     res.json({ suggestions });
   } catch (err) {
-    console.error(err);
+    console.error("Embedding/RPC gagal, coba fallback kata kunci:", err);
+
+    // Embedding atau RPC gagal total (misal model error, Supabase RPC bermasalah) —
+    // tetap coba kasih saran lewat pencarian kata kunci biasa
+    try {
+      const keywordResults = await keywordFallbackSearch(customerMessage);
+      if (keywordResults.length > 0) {
+        return res.json({ suggestions: keywordResults });
+      }
+    } catch (fallbackErr) {
+      console.error("Fallback kata kunci juga gagal:", fallbackErr);
+    }
+
     res.status(500).json({ error: "Gagal generate saran jawaban" });
+  }
+});
+
+// ============================================
+// ENDPOINT: daftar semua kategori unik yang ada
+// ============================================
+app.get("/api/categories", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("faq_answers")
+      .select("kategori")
+      .not("kategori", "is", null);
+
+    if (error) throw error;
+
+    const uniqueCategories = [...new Set((data || []).map((d) => d.kategori))].filter(Boolean).sort();
+    res.json({ categories: uniqueCategories });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Gagal ambil daftar kategori" });
+  }
+});
+
+// ============================================
+// ENDPOINT: cari jawaban berdasarkan kategori (manual, tanpa embedding)
+// Cara pakai: GET /api/faqs-by-category?kategori=pengiriman
+// ============================================
+app.get("/api/faqs-by-category", async (req, res) => {
+  const { kategori } = req.query;
+  if (!kategori) {
+    return res.status(400).json({ error: "Parameter kategori kosong" });
+  }
+
+  try {
+    const { data: answers, error } = await supabase
+      .from("faq_answers")
+      .select("id, answer, kategori")
+      .eq("kategori", kategori);
+
+    if (error) throw error;
+
+    if (!answers || answers.length === 0) {
+      return res.json({ suggestions: [] });
+    }
+
+    // Ambil salah satu contoh pertanyaan per jawaban, biar agent tahu konteksnya
+    const answerIds = answers.map((a) => a.id);
+    const { data: questions } = await supabase
+      .from("faq_questions")
+      .select("faq_answer_id, question")
+      .in("faq_answer_id", answerIds);
+
+    const questionMap = {};
+    (questions || []).forEach((q) => {
+      if (!questionMap[q.faq_answer_id]) questionMap[q.faq_answer_id] = q.question;
+    });
+
+    const suggestions = answers.map((a) => ({
+      answer: a.answer,
+      source: "kategori",
+      kategori: a.kategori,
+      contoh_pertanyaan: questionMap[a.id] || null,
+    }));
+
+    res.json({ suggestions });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Gagal ambil jawaban berdasarkan kategori" });
   }
 });
 
@@ -131,7 +289,7 @@ app.get("/admin/generate-embeddings", async (req, res) => {
   try {
     const { data: rows, error } = await supabase
       .from("faq_questions")
-      .select("id, question, faq_answers(answer)")
+      .select("id, question, faq_answer_id")
       .is("embedding", null);
 
     if (error) throw error;
@@ -140,9 +298,23 @@ app.get("/admin/generate-embeddings", async (req, res) => {
       return res.json({ message: "Tidak ada pertanyaan yang perlu di-generate embedding-nya.", processed: 0 });
     }
 
+    // Ambil semua jawaban terkait dalam 1 query terpisah (lebih aman daripada join)
+    const answerIds = [...new Set(rows.map((r) => r.faq_answer_id))];
+    const { data: answerRows, error: answerFetchError } = await supabase
+      .from("faq_answers")
+      .select("id, answer")
+      .in("id", answerIds);
+
+    if (answerFetchError) throw answerFetchError;
+
+    const answerMap = {};
+    (answerRows || []).forEach((a) => {
+      answerMap[a.id] = a.answer;
+    });
+
     const results = [];
     for (const row of rows) {
-      const answerText = row.faq_answers ? row.faq_answers.answer : "";
+      const answerText = answerMap[row.faq_answer_id] || "";
       const combinedText = `${row.question}\n${answerText}`;
       try {
         const embedding = await getEmbeddingLocal(combinedText);
